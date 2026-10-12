@@ -1,0 +1,12 @@
+What is 17 + 25? Reply with only the number.
+Extract the city from this record: {"name":"Ada","city":"Bristol","role":"engineer"}. Reply with only the city name.
+Sort these numbers in ascending order: 9, 2, 5, 1. Reply with only a JSON array.
+A sensor reports 21 Celsius. Convert it to Fahrenheit. Reply with only the number.
+Given the table A=red, B=blue, C=green, what colour is B? Reply with only the colour.
+What does this Python expression evaluate to: sum([2, 4, 6])? Reply with only the number.
+Choose the right tool to obtain the weather forecast from these tools: calculator, weather, calendar. Reply with only the tool name.
+Return a JSON object with exactly these fields and values: status is ok, count is 3. Do not add any explanation.
+Write a short story about a robot who learns to garden.
+Explain why the sky appears blue in simple words.
+Complete a Python function that returns the nth Fibonacci number.
+Summarise the benefits and limitations of running language models locally.

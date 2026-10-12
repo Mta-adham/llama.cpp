@@ -149,6 +149,11 @@ flake.lock
 # emscripten
 a.out.*
 
+# perf-eval / Artemis results (written fresh by each benchmark run)
+
+artemis_results.json
+artemis_results.tmp
+
 # AGENTS
 
 AGENTS.local.md
