@@ -6,24 +6,24 @@ Quality follows journey-video/review/llamacpp-config-discovery/harness-v2.py:
   tasks       64 ARC multiple-choice questions (data/screen.*), answered by greedy decoding
   perplexity  8 x 512-token chunks of data/ppl.txt
 
-Modes:
-  reference  run the quality checks and save them as this eval's reference
-  benchmark  run the quality checks, gate them against the reference, run batched-bench
-             throughput, then write metrics to artemis_results.json
+benchmark measures the quality of the code copy it runs in and saves it as that copy's baseline,
+stops if the model is broken (smoke below smoke_min or non-finite perplexity), then runs
+batched-bench throughput and writes all metrics to artemis_results.json. Versions are compared
+on those metrics (quality_correct, smoke_passed, perplexity, tokens/s) by Artemis.
 
-Each eval is a JSON config overriding keys in DEFAULT; 'name' keeps its reference and
-results separate under ../perf-eval-results/<name>/ (outside the checkout).
+Each eval is a JSON config overriding keys in DEFAULT. Logs, the baseline and a labelled copy
+of the results go to ../perf-eval-results/<name>/ (outside the checkout).
 
-  python scripts/perf-eval.py reference scripts/perf-eval/gemma-e4b.json
   python scripts/perf-eval.py benchmark scripts/perf-eval/gemma-e4b.json
 
-The probe is built from scripts/perf-eval/probe.cpp, see scripts/perf-eval/build-probe.sh.
+Build the binaries first: python scripts/perf-eval/build.py
 """
 import hashlib
 import json
 import math
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -41,7 +41,11 @@ GEMMA_TEMPLATE = '<|turn>user\n{prompt}<turn|>\n<|turn>model\n'
 DEFAULT = {
     'name': None,
     'model': None,
-    'threads': 16,
+    # Core Ultra X7 368H: 4 fast cores, 8 efficiency, 4 low-power. Generation is fastest on one
+    # thread per fast core; prompt processing still gains from the other cores
+    'threads': 4,
+    'threads_batch': 16,
+    'repeats': 3,  # throughput runs; the median is reported because the CPU clock varies a lot
     'batch': 2048,
     'ubatch': 512,
     'cache_k': 'f16',
@@ -52,13 +56,12 @@ DEFAULT = {
     'chat_template': GEMMA_TEMPLATE,  # prompt wrapper used by the probe, '{prompt}' is replaced
     'ppl_text': str(DATA / 'ppl.txt'),
     'ppl_chunks': 8,
-    'ppl_tolerance': 0.05,  # allowed relative perplexity increase vs reference
-    'task_tolerance': 2,    # allowed drop in correct answers, overall and per subset
-    'smoke_min': 7,         # smoke prompts out of 8 that must match exactly
+    'smoke_min': 7,  # smoke prompts out of 8 that must match exactly, below this the model is broken
     # batched-bench
-    'ctx': 8192,
-    'npp': [512],
-    'ntg': [64],
+    'ctx': 4096,
+    'npp': [256],
+    # 256 prompt + 32 generated tokens keep each throughput run short; speeds are per token
+    'ntg': [32],
     'npl': [1, 4],
 }
 # llama-perplexity names -> ggml_type ids for the probe
@@ -80,6 +83,8 @@ def config(path):
     assert c['cache_k'] in CACHE_TYPES and c['cache_v'] in CACHE_TYPES, 'bad KV cache type'
     assert c['flash'] in ('on', 'off', 'auto')
     assert isinstance(c['repack'], bool)
+    for k in ['threads', 'threads_batch', 'repeats']:
+        assert isinstance(c[k], int) and c[k] > 0, f'{k} must be a positive integer'
     for k in ['npp', 'ntg', 'npl']:
         assert isinstance(c[k], list) and c[k] and all(isinstance(x, int) and x > 0 for x in c[k]), k
     need = max(c['npl']) * (max(c['npp']) + max(c['ntg']))
@@ -107,7 +112,7 @@ def run(args, log, env=None, timeout=6 * 3600):
 
 
 def common_args(c):
-    args = ['-m', c['model'], '-t', c['threads'], '-b', c['batch'], '-ub', c['ubatch'],
+    args = ['-m', c['model'], '-t', c['threads'], '-tb', c['threads_batch'], '-b', c['batch'], '-ub', c['ubatch'],
             '-fa', c['flash'], '-ctk', c['cache_k'], '-ctv', c['cache_v']]
     if not c['repack']:
         args += ['--no-repack']
@@ -119,7 +124,8 @@ def probe(c, prompts, log, tokens):
     env.update({'EDGE_CTX': '2048', 'EDGE_BATCH': str(min(c['batch'], 2048)), 'EDGE_UBATCH': str(c['ubatch']),
                 'EDGE_REPACK': str(int(c['repack'])), 'EDGE_FA': str(int(c['flash'] == 'on')),
                 'EDGE_K': str(CACHE_TYPES[c['cache_k']]), 'EDGE_V': str(CACHE_TYPES[c['cache_v']]),
-                'EDGE_TOKENS': str(tokens), 'EDGE_TEMPLATE': c['chat_template']})
+                'EDGE_TOKENS': str(tokens), 'EDGE_TEMPLATE': c['chat_template'],
+                'EDGE_THREADS_BATCH': str(c['threads_batch'])})
     stdout, _, _ = run([BIN / f'edge-probe{EXE}', c['model'], prompts, c['threads'], 'quality'], log, env)
     return [json.loads(l) for l in stdout.splitlines() if l.startswith('{')]
 
@@ -170,18 +176,39 @@ def quality(c, D):
     return q
 
 
-def gate(q, ref, c):
-    tol = c['task_tolerance']
-    assert q['smoke'] >= c['smoke_min'], f"smoke {q['smoke']}/8 below {c['smoke_min']}/8"
-    assert q['correct'] >= ref['correct'] - tol, f"tasks {q['correct']}/64 dropped more than {tol} from reference {ref['correct']}/64"
-    assert all(a >= b - tol for a, b in zip(q['subsets'], ref['subsets'])), f"subset {q['subsets']} dropped more than {tol} from reference {ref['subsets']}"
+def gate(q, c):
+    # only rejects a broken model; how quality compares between versions is read from the metrics
+    assert q['smoke'] >= c['smoke_min'], f"smoke {q['smoke']}/8 below {c['smoke_min']}/8, the model output is broken"
     assert math.isfinite(q['ppl']), 'perplexity is not finite'
-    limit = ref['ppl'] * (1 + c['ppl_tolerance'])
-    assert q['ppl'] <= limit, f"perplexity {q['ppl']:.4f} > {limit:.4f} (reference {ref['ppl']:.4f} + {c['ppl_tolerance']:.0%})"
 
 
 def summary(q):
     return {'smoke': f"{q['smoke']}/8", 'tasks': f"{q['correct']}/64", 'subsets': q['subsets'], 'ppl': q['ppl']}
+
+
+def stamp(t):
+    return time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(t))
+
+
+def run_info(c):
+    # what was measured; kept out of artemis_results.json, which must stay numeric-only
+    model = Path(c['model'])
+    with model.open('rb') as f:
+        sha = hashlib.file_digest(f, 'sha256').hexdigest()
+    tools = [BIN / f'{n}{EXE}' for n in ('llama-perplexity', 'llama-batched-bench', 'edge-probe')]
+    missing = [t.name for t in tools if not t.exists()]
+    assert not missing, f'missing {missing}, build first: python scripts/perf-eval/build.py'
+    git = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True)
+    return {
+        'eval': c['name'],
+        'model': model.name,
+        'model_path': str(model),
+        'model_bytes': model.stat().st_size,
+        'model_sha256': sha,
+        'build_timestamp': stamp(max(t.stat().st_mtime for t in tools)),
+        'git_commit': git.stdout.strip() if git.returncode == 0 else None,
+        'run_timestamp': stamp(time.time()),
+    }
 
 
 def main(mode, path):
@@ -189,25 +216,20 @@ def main(mode, path):
     c = config(path)
     E = OUT / c['name']
     D = E / identity(c)
-    D.mkdir(parents=True, exist_ok=True)
-    dump(D / 'config.json', c)
-    reference = E / 'reference.json'
-
-    if mode == 'reference':
-        q = quality(c, D)
-        dump(reference, {'config': c, **q})
-        print('REFERENCE ' + json.dumps(summary(q)))
-    elif mode == 'benchmark':
+    if mode == 'benchmark':
+        D.mkdir(parents=True, exist_ok=True)
+        dump(D / 'config.json', c)
         Path('artemis_results.json').unlink(missing_ok=True)
-        assert reference.exists(), f'no reference for {c["name"]} yet, run: python scripts/perf-eval.py reference {path}'
-        ref = json.loads(reference.read_text())
-        assert Path(ref['config']['model']).name == Path(c['model']).name, \
-            f"reference was made with {Path(ref['config']['model']).name}, rerun: python scripts/perf-eval.py reference {path}"
+        Path('run_info.json').unlink(missing_ok=True)
+        info = run_info(c)
+        print('RUN ' + json.dumps(info), flush=True)
+        # baseline of this copy of the code
         q = quality(c, D)
-        print('QUALITY ' + json.dumps(summary(q)) + '  reference ' + json.dumps(summary(ref)), flush=True)
-        gate(q, ref, c)
+        dump(D / 'quality.json', {'config': c, **q})
+        print('QUALITY ' + json.dumps(summary(q)), flush=True)
+        gate(q, c)
 
-        rows = throughput(c, D)
+        rows, runs = throughput(c, D)
         single = [r for r in rows if r['pl'] == 1] or rows
         widest = [r for r in rows if r['pl'] == max(c['npl'])]
         m = {
@@ -221,15 +243,16 @@ def main(mode, path):
             'model_size_mib': Path(c['model']).stat().st_size / 1048576,
         }
         assert all(math.isfinite(v) and v > 0 for v in m.values()), m
-        dump(D / f"sample-{time.strftime('%Y%m%dT%H%M%S')}.json", {'config': c, 'metrics': m, 'quality': q, 'bench': rows})
+        dump(D / f"sample-{time.strftime('%Y%m%dT%H%M%S')}.json", {'run': info, 'config': c, 'metrics': m, 'quality': q, 'bench': rows, 'bench_runs': runs})
         # labelled copy per eval; the one in the checkout must stay numeric-only for Artemis
-        dump(E / 'artemis_results.json', {'eval': c['name'], 'model': Path(c['model']).name, 'metrics': m})
+        dump(E / 'artemis_results.json', {**info, 'metrics': m})
+        dump('run_info.json', info)
         dump('artemis_results.tmp', m)
         Path('artemis_results.tmp').replace('artemis_results.json')
-        print(f"eval: {c['name']}  model: {Path(c['model']).name}")
+        print(f"eval: {info['eval']}  model: {info['model']}  built: {info['build_timestamp']}")
         print(json.dumps(m, indent=2))
     else:
-        raise ValueError(f'unknown mode {mode!r}, expected reference or benchmark')
+        raise ValueError(f'unknown mode {mode!r}, expected benchmark')
     print(f'{mode}: {time.monotonic() - start:.1f}s (logs in {D})', flush=True)
 
 
@@ -237,13 +260,23 @@ def throughput(c, D):
     args = [BIN / f'llama-batched-bench{EXE}', *common_args(c), '-c', c['ctx'],
             '-npp', ','.join(map(str, c['npp'])), '-ntg', ','.join(map(str, c['ntg'])),
             '-npl', ','.join(map(str, c['npl'])), '--output-format', 'jsonl']
-    _, out, _ = run(args, D / 'batched-bench.log')
-    rows = [json.loads(l) for l in out.splitlines() if l.startswith('{"n_kv_max"')]
-    assert rows, f"no jsonl rows in {D / 'batched-bench.log'}"
-    return rows
+    runs = []
+    for i in range(c['repeats']):
+        _, out, _ = run(args, D / f'batched-bench-{i + 1}.log')
+        rows = [json.loads(l) for l in out.splitlines() if l.startswith('{"n_kv_max"')]
+        assert rows, f"no jsonl rows in {D / f'batched-bench-{i + 1}.log'}"
+        runs.append(rows)
+    # median of each speed over the repeats, per (pp, tg, pl) test
+    median = []
+    for group in zip(*runs):
+        row = dict(group[0])
+        for k in ('speed_pp', 'speed_tg', 'speed'):
+            row[k] = statistics.median(r[k] for r in group)
+        median.append(row)
+    return median, runs
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
-        sys.exit('usage: perf-eval.py <reference|benchmark> <config.json>')
+        sys.exit('usage: perf-eval.py benchmark <config.json>')
     main(sys.argv[1], sys.argv[2])

@@ -42,7 +42,7 @@ int main(int argc,char **argv){
  while(std::getline(in,line)){if(!line.empty()&&line.back()=='\r')line.pop_back();if(!line.empty())prompts.push_back(line);}if(prompts.empty())return 4;
  llama_backend_init();auto load=Clock::now();auto mp=llama_model_default_params();mp.n_gpu_layers=0;mp.load_mode=(llama_load_mode)setting("EDGE_LOAD",-1);mp.use_extra_bufts=setting("EDGE_REPACK",1);mp.lazy_mode=(llama_lazy_mode)setting("EDGE_LAZY",1);
  auto *model=llama_model_load_from_file(argv[1],mp);if(!model)return 5;auto *vocab=llama_model_get_vocab(model);
- auto cp=llama_context_default_params();cp.n_ctx=setting("EDGE_CTX",2048);cp.n_batch=setting("EDGE_BATCH",512);cp.n_ubatch=setting("EDGE_UBATCH",512);cp.n_threads=threads;cp.n_threads_batch=threads;cp.flash_attn_type=setting("EDGE_FA",0)?LLAMA_FLASH_ATTN_TYPE_ENABLED:LLAMA_FLASH_ATTN_TYPE_DISABLED;cp.type_k=(ggml_type)setting("EDGE_K",1);cp.type_v=(ggml_type)setting("EDGE_V",1);
+ auto cp=llama_context_default_params();cp.n_ctx=setting("EDGE_CTX",2048);cp.n_batch=setting("EDGE_BATCH",512);cp.n_ubatch=setting("EDGE_UBATCH",512);cp.n_threads=threads;cp.n_threads_batch=setting("EDGE_THREADS_BATCH",threads);cp.flash_attn_type=setting("EDGE_FA",0)?LLAMA_FLASH_ATTN_TYPE_ENABLED:LLAMA_FLASH_ATTN_TYPE_DISABLED;cp.type_k=(ggml_type)setting("EDGE_K",1);cp.type_v=(ggml_type)setting("EDGE_V",1);
  auto *ctx=llama_init_from_model(model,cp);if(!ctx)return 6;double load_ms=ms(load);
  auto *sampler=llama_sampler_init_greedy();auto *batch=llama_batch_ext_init(ctx);
  int repeats=latency?3:(int)prompts.size();

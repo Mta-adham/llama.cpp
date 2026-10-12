@@ -153,6 +153,7 @@ a.out.*
 
 artemis_results.json
 artemis_results.tmp
+run_info.json
 
 # AGENTS
 
